@@ -1,0 +1,16 @@
+# Streamlit server config - 100MB max upload for Cloudflare tunnel compatibility
+# Cloudflare has a 100MB request body limit; exceeding it causes upload failures
+[server]
+maxUploadSize = 100
+
+# Theme - consistent colors on desktop and mobile (prevents mobile color shift)
+[theme]
+base = "light"
+primaryColor = "#7B2CBF"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F5F5"
+textColor = "#262730"
+
+[theme.sidebar]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F5F5"
