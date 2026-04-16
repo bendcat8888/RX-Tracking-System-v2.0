@@ -1,149 +1,82 @@
-# RX Tracking System v2.0 (Streamlit) — AI-Assisted Matching
+# 🧬 RX Tracking System v2.0
+**AI-Assisted Data Consolidation & Record Linkage Engine**
 
-RX Tracking System v2.0 is a Streamlit web application for consolidating RX transaction files and matching doctor records against a masterlist using a multi-step rules engine with AI-assisted matching (TF‑IDF + nearest-neighbor similarity). It produces standardized outputs, matching metrics, and export-ready reports.
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)](https://www.python.org/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=Streamlit&logoColor=white)](https://streamlit.io/)
+[![Scikit-Learn](https://img.shields.io/badge/scikit--learn-%23F7931E.svg?style=for-the-badge&logo=scikit-learn&logoColor=white)](https://scikit-learn.org/)
+[![Machine Learning](https://img.shields.io/badge/AI-Matching-blueviolet?style=for-the-badge)](https://en.wikipedia.org/wiki/Record_linkage)
 
-## Key Features
+## 🛠 Tech Stack
 
-- **Two matching modes**
-  - **Basic**: exact matching with strict rules (drives `suggest_dn = TRUE`).
-  - **Advanced**: optimized batch matching with similarity thresholds (AI-type matches; `suggest_dn` remains `FALSE`).
-- **AI-assisted matching for unmatched rows**
-  - TF‑IDF character n-grams + `NearestNeighbors` for doctor name and PTR.
-  - Optional PPE Doctors matching.
-  - Word-based “Quick Suggest” with optional reference CSV integration.
-- **Metrics dashboard**
-  - Masterlist Match Rate, AI Match Rate, Quick Suggest Rate, total amounts, record counts.
-- **Export**
-  - Downloadable results in consistent column order.
-- **Data integrity safeguards**
-  - Amount column preservation + validation checks between matching steps.
-- **Reference/auxiliary datasets**
-  - `doctors_reference.csv`, `ppe_doctors.csv`, `ptr_with_topmd.csv`, item cross references, masterlist.
+| Category | Tools |
+| :--- | :--- |
+| **Language** | **Python 3.12** |
+| **AI / ML** | **Scikit-learn** (TF-IDF, NearestNeighbors), **RapidFuzz** (String Similarity) |
+| **Data Processing** | **Pandas** & **NumPy** (High-performance Dataframe Manipulation) |
+| **Frontend** | **Streamlit** (Interactive Metrics & Matching GUI) |
+| **Database** | **SQL Server** (via SQLAlchemy & pyodbc) |
+| **Architecture** | **Multi-step Rules Engine** (Exact ➔ Fuzzy ➔ AI) |
 
-## Project Layout
+---
 
-- `RXTracking_WebGUI_Streamlit.py` — main Streamlit application
-- `.streamlit/config.toml` — Streamlit configuration
-- `.streamlit/secrets.toml` — local/server-only secrets (not committed)
-- `rx_md_masterlist.csv` — doctor masterlist
-- `ptr_with_topmd.csv` — PTR final mapping (TopMD)
-- `ppe_doctors.csv` — PPE doctor list (optional, can auto-download if configured)
-- `doctors_reference.csv` — optional reference list for Quick Suggest
-- `rx_item_cross_ref.csv`, `Table_Item.csv` — item-related reference data (if used by your workflow)
+## 🎯 Project Overview
+The **RX Tracking System v2.0** is an intelligent data-cleaning and reconciliation platform. It automates the matching of messy RX transaction records against a master doctor list using a hybrid approach of **deterministic rules** and **probabilistic AI matching**.
 
-## Matching Output Columns (Core)
+### 🧠 AI-Assisted Matching Pipeline
+To achieve high match rates where standard SQL joins fail, the system utilizes a sophisticated pipeline:
+1.  **Exact Match:** Deterministic key-based matching for high-confidence links.
+2.  **Vectorized Similarity (TF-IDF):** Converts doctor names and addresses into character n-gram vectors.
+3.  **K-Nearest Neighbors (k-NN):** Efficiently searches the vector space to find the closest match in the masterlist for unmatched records.
+4.  **Quick Suggest:** A word-based fuzzy heuristic for real-time human-in-the-loop verification.
 
-The app uses internal columns and also renames some for display/export:
+---
 
-- `suggested_md` → displayed as `suggest_dn`
-- `md_official_name` → displayed as `MD NAME FINAL`
-- `md_ptrs` → displayed as `PTR FINAL`
+## 🚀 Key Professional Capabilities
 
-Other common columns:
-- `quick_suggest_name`, `suggested_name`
-- `DOCTOR_CODE`, `CUSTOMER_CODE`
-- Transaction fields: `Doctor Name`, `PTR No`, `Address1`, `Branch Code`, etc.
+### 📊 Advanced Analytics Dashboard
+* **Real-time Metrics:** Tracks "Masterlist Match Rate" vs "AI Match Rate" to give stakeholders transparency into data quality.
+* **Financial Integrity:** Implemented validation checks between matching steps to ensure total amounts and transaction counts remain 100% accurate.
 
-## Matching Pipeline (High Level)
+### 🛡️ Enterprise Data Engineering
+* **Hybrid Matching Modes:** Offers "Basic" (Strict/Safe) and "Advanced" (AI-Driven) modes to balance speed and accuracy.
+* **Memory Management:** Optimized for large pharmaceutical datasets by leveraging efficient vectorized operations in Scikit-Learn.
+* **Cross-Reference Logic:** Handles complex many-to-one mappings for Item and PTR cross-references.
 
-Typical flow (Basic mode):
+### 💼 Professional Workflow Features
+* **Audit-Ready Exports:** Standardized column formatting ensuring the output is ready for immediate ingestion into downstream ERP or BI systems.
+* **Reference Integration:** Dynamic loading of auxiliary datasets (PPE Doctors, PTR Mappings) to enrich transaction data.
 
-1. **Exact Match (Basic)**  
-   Exact key match using Doctor Name and/or PTR No (normalized). Sets `suggest_dn = TRUE`.
-2. **Exact Address Match**  
-   Exact match on `(Doctor Name, Address1)` ↔ `(md_suggest, md_add_1)`. Keeps `suggest_dn = FALSE`.
-3. **AI Matching (TF‑IDF Masterlist)**  
-   Tries to match unmatched records using similarity (doctor name and/or PTR), with validations.
-4. **PPE Doctors Matching (optional)**  
-   Matches remaining blanks using PPE Doctors list.
-5. **Quick Suggest (final step)**  
-   Word-based matching + reference integration; fills quick suggestions without claiming TRUE matches.
-6. **Unmatched labeling**  
-   True unmatched records are left blank in `suggest_dn`.
+---
 
-## Requirements
+## ⚙️ Development & Installation
 
-This app is a Streamlit + pandas + SQL Server workflow. Install dependencies (example):
+### Requirements
+- **Python 3.10+**
+- **ODBC Driver 18 for SQL Server**
 
+### Quick Start
 ```bash
-pip install streamlit pandas sqlalchemy scikit-learn rapidfuzz psutil pyodbc openpyxl
-```
+# 1. Install Dependencies
+pip install streamlit pandas sqlalchemy scikit-learn rapidfuzz pyodbc openpyxl
 
-### SQL Server Driver (Windows)
+# 2. Configure Secrets
+# Add DB credentials to .streamlit/secrets.toml
 
-Install a Microsoft ODBC driver (e.g., “ODBC Driver 18 for SQL Server” or “ODBC Driver 17 for SQL Server”) and ensure it is visible in ODBC Data Sources.
-
-## Secure Configuration (IMPORTANT)
-
-### Do NOT commit secrets
-This repo is intended to be public/private on GitHub without exposing credentials.
-
-- Keep `.streamlit/secrets.toml` out of Git (recommended).
-- Use environment variables on production servers when possible.
-
-### Option A — Streamlit Secrets (recommended for Streamlit hosting)
-Create a local/server file:
-
-`./.streamlit/secrets.toml`
-
-```toml
-[db_credentials]
-host = "YOUR_SERVER\\INSTANCE"
-user = "YOUR_USERNAME"
-password = "YOUR_PASSWORD"
-rxtracking_database = "RXTracking"
-innogen_database = "InnogenBC174"
-```
-
-### Option B — Environment Variables
-
-```text
-DB_HOST=YOUR_SERVER\INSTANCE
-DB_USER=YOUR_USERNAME
-DB_PASSWORD=YOUR_PASSWORD
-DB_NAME_RXTRACKING=RXTracking
-DB_NAME_INNOGEN=InnogenBC174
-```
-
-If you previously committed credentials, rotate passwords immediately and purge history before publishing.
-
-## Run Locally
-
-From the project directory:
-
-```bash
+# 3. Launch the AI Matching Engine
 streamlit run RXTracking_WebGUI_Streamlit.py
 ```
 
-## Notes on Data Files
+---
 
-- Keep reference CSVs in the project folder if you want them loaded locally.
-- Some features (like PPE auto-update) may depend on your SQL stored procedures and network access.
+## 📜 License & Intellectual Property
+**Copyright (c) 2026 Benedic Cater / InnoGen Pharmaceuticals Inc. (Solvang)**
 
-## Troubleshooting
+**All Rights Reserved.**
+This repository is published for **portfolio review and technical demonstration purposes only.**
 
-- **DB connection fails**
-  - Confirm ODBC driver installed.
-  - Confirm credentials configured via secrets/env.
-  - Confirm server/instance name resolves from the machine running Streamlit.
-- **Memory issues on large datasets**
-  - Use Basic mode first, then AI matching.
-  - Reduce dataset size or run on a machine with more RAM.
-- **Quick Suggest / Reference not working**
-  - Confirm `doctors_reference.csv` exists and has expected columns.
+**Strict Restrictions:**
+- **No Reproduction:** No part of this code may be copied, modified, or distributed.
+- **Brand Protection:** Use of the "InnoGen" or "Solvang" name, branding, or logos is strictly prohibited.
+- **Data Privacy:** Use of any proprietary data or business logic contained herein for commercial or personal projects is strictly prohibited.
 
-
-## License
-
-### Copyright (c) 2026 Benedic Cater / InnoGen Pharmaceuticals Inc.
-
-### All Rights Reserved.
-
-This repository and its contents, including all code, assets, and data, are the sole property of the author. This code is made public for portfolio review and demonstration purposes only.
-
-### Restrictions:
-- You may not copy, modify, or distribute this code.
-- You may not use the "InnoGen" name, branding, or logos for any purpose.
-- Use of the data contained within this repository for commercial or personal projects is strictly prohibited.
-
-For inquiries or permission requests, please contact the author.
+_For professional inquiries or permission requests, please contact Benedic Cater._
