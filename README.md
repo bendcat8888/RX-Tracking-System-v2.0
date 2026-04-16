@@ -135,10 +135,15 @@ streamlit run RXTracking_WebGUI_Streamlit.py
 
 ## License
 
-Copyright (c) 2026 InnoGen Pharmaceuticals Inc. All rights reserved.
+### Copyright (c) 2026 Benedic Cater / InnoGen Pharmaceuticals Inc.
 
-Author/Maintainer: Benedic Cater
+### All Rights Reserved.
 
-This software is proprietary and confidential. No part of this repository may be copied, modified, published, distributed, or used to create derivative works without prior written permission from InnoGen Pharmaceuticals Inc.
+This repository and its contents, including all code, assets, and data, are the sole property of the author. This code is made public for portfolio review and demonstration purposes only.
 
-For internal use only.
+### Restrictions:
+- You may not copy, modify, or distribute this code.
+- You may not use the "InnoGen" name, branding, or logos for any purpose.
+- Use of the data contained within this repository for commercial or personal projects is strictly prohibited.
+
+For inquiries or permission requests, please contact the author.
