@@ -132,6 +132,13 @@ streamlit run RXTracking_WebGUI_Streamlit.py
 - **Quick Suggest / Reference not working**
   - Confirm `doctors_reference.csv` exists and has expected columns.
 
+
 ## License
 
-Add your preferred license here (internal/private use, or an open-source license if publishing).
+Copyright (c) 2026 InnoGen Pharmaceuticals Inc. All rights reserved.
+
+Author/Maintainer: Benedic Cater
+
+This software is proprietary and confidential. No part of this repository may be copied, modified, published, distributed, or used to create derivative works without prior written permission from InnoGen Pharmaceuticals Inc.
+
+For internal use only.
