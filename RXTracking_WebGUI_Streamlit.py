@@ -187,8 +187,8 @@ def get_csv_dir():
 
 def get_reference_csv_dir():
     """
-    Get the directory for reference CSV file storage (doctors_reference.csv, ppe_doctors.csv).
-    
+    Get the directory for reference CSV file storage.
+
     Uses script_dir (persistent location) instead of temp directory because reference files
     need to persist across sessions and should be accessible to all users.
     
@@ -196,6 +196,206 @@ def get_reference_csv_dir():
         str: Path to the script directory for reference CSV files
     """
     return os.path.dirname(os.path.abspath(__file__))
+
+ITEM_CROSS_REF_FILENAME = 'rx_item_cross_ref.csv'
+ITEM_CROSS_REF_KEY_COLUMN = 'Cross-Reference No.'
+ITEM_CROSS_REF_REQUIRED_COLUMNS = [ITEM_CROSS_REF_KEY_COLUMN, 'Item No.']
+ITEM_CROSS_REF_DEFAULT_COLUMNS = [
+    'Cross-Reference No.',
+    'Item No.',
+    'Description',
+    'FINAL GROSS Unit Price',
+    'DOH CEILING PRICE',
+    'DISC',
+    'net of disc',
+    'FINAL NET PRICE',
+    'VAT Product Posting Group',
+    'DIVISION',
+    'Standard Cost',
+]
+
+def get_item_cross_ref_path():
+    """Return the persistent path for rx_item_cross_ref.csv."""
+    return os.path.join(get_reference_csv_dir(), ITEM_CROSS_REF_FILENAME)
+
+def _normalize_upload_column_name(column_name):
+    return re.sub(r'\s+', ' ', str(column_name).strip()).lower()
+
+def _normalize_item_cross_ref_key(series):
+    return series.fillna('').astype(str).str.strip().str.upper()
+
+def get_item_cross_ref_columns():
+    """Use the current cross-reference header when available; otherwise use the default schema."""
+    cross_ref_path = get_item_cross_ref_path()
+    if os.path.exists(cross_ref_path):
+        try:
+            existing_columns = pd.read_csv(cross_ref_path, nrows=0).columns.tolist()
+            existing_columns = [str(col).strip() for col in existing_columns if str(col).strip()]
+            if existing_columns:
+                return existing_columns
+        except Exception as e:
+            logger.warning(f"Could not read rx_item_cross_ref.csv columns: {str(e)}")
+    return ITEM_CROSS_REF_DEFAULT_COLUMNS.copy()
+
+def build_item_cross_ref_template():
+    """Build an Excel template with the current cross-reference columns and one sample row."""
+    columns = get_item_cross_ref_columns()
+    sample_row = {col: '' for col in columns}
+    cross_ref_path = get_item_cross_ref_path()
+
+    if os.path.exists(cross_ref_path):
+        try:
+            sample_df = pd.read_csv(cross_ref_path, dtype=str, nrows=1).fillna('')
+            if not sample_df.empty:
+                sample_row.update(sample_df.iloc[0].to_dict())
+        except Exception as e:
+            logger.warning(f"Could not read rx_item_cross_ref.csv sample row: {str(e)}")
+
+    if not sample_row.get(ITEM_CROSS_REF_KEY_COLUMN):
+        sample_row[ITEM_CROSS_REF_KEY_COLUMN] = 'SAMPLE-CROSS-REF'
+    if not sample_row.get('Item No.'):
+        sample_row['Item No.'] = 'IP0000001'
+    if 'Description' in sample_row and not sample_row.get('Description'):
+        sample_row['Description'] = 'Sample Item'
+
+    template_df = pd.DataFrame([sample_row], columns=columns)
+    output = BytesIO()
+    try:
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            template_df.to_excel(writer, index=False, sheet_name='Item Cross Reference')
+        return (
+            output.getvalue(),
+            'rx_item_cross_ref_template.xlsx',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+    except Exception as e:
+        logger.warning(f"Could not build Excel template; falling back to CSV template: {str(e)}")
+        return (
+            template_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig'),
+            'rx_item_cross_ref_template.csv',
+            'text/csv',
+        )
+
+def read_item_cross_ref_upload(uploaded_file):
+    """Read an uploaded item cross-reference file into a DataFrame."""
+    file_extension = uploaded_file.name.split('.')[-1].lower()
+    if file_extension == 'csv':
+        return pd.read_csv(uploaded_file, dtype=str, encoding='utf-8-sig', on_bad_lines='skip')
+    if file_extension in ['xlsx', 'xls']:
+        return pd.read_excel(uploaded_file, dtype=str, engine='openpyxl' if file_extension == 'xlsx' else None)
+    raise ValueError("Unsupported file type. Please upload an Excel or CSV file.")
+
+def upsert_item_cross_ref_from_upload(uploaded_file):
+    """
+    Validate and upsert uploaded item cross-reference rows.
+
+    Existing rows are matched by Cross-Reference No.; matching rows are replaced and
+    non-existing rows are appended.
+    """
+    expected_columns = get_item_cross_ref_columns()
+    expected_lookup = {_normalize_upload_column_name(col): col for col in expected_columns}
+
+    uploaded_df = read_item_cross_ref_upload(uploaded_file)
+    if uploaded_df is None or uploaded_df.empty:
+        return False, "Uploaded file is empty.", None
+
+    uploaded_df.columns = [str(col).strip() for col in uploaded_df.columns]
+    uploaded_lookup = {}
+    duplicate_columns = []
+    for col in uploaded_df.columns:
+        normalized_col = _normalize_upload_column_name(col)
+        if normalized_col in uploaded_lookup:
+            duplicate_columns.append(col)
+        uploaded_lookup[normalized_col] = col
+
+    if duplicate_columns:
+        return False, f"Duplicate uploaded columns found: {', '.join(duplicate_columns)}", None
+
+    missing_required = [
+        col for col in ITEM_CROSS_REF_REQUIRED_COLUMNS
+        if _normalize_upload_column_name(col) not in uploaded_lookup
+    ]
+    if missing_required:
+        return False, f"Missing required column(s): {', '.join(missing_required)}", None
+
+    aligned_df = pd.DataFrame(index=uploaded_df.index)
+    missing_optional = []
+    for expected_col in expected_columns:
+        source_col = uploaded_lookup.get(_normalize_upload_column_name(expected_col))
+        if source_col:
+            aligned_df[expected_col] = uploaded_df[source_col]
+        else:
+            aligned_df[expected_col] = ''
+            if expected_col not in ITEM_CROSS_REF_REQUIRED_COLUMNS:
+                missing_optional.append(expected_col)
+
+    extra_columns = [
+        col for col in uploaded_df.columns
+        if _normalize_upload_column_name(col) not in expected_lookup
+    ]
+
+    aligned_df = aligned_df.fillna('')
+    for col in aligned_df.columns:
+        aligned_df[col] = aligned_df[col].astype(str).str.strip()
+
+    before_blank_filter = len(aligned_df)
+    valid_required_mask = pd.Series(True, index=aligned_df.index)
+    for required_col in ITEM_CROSS_REF_REQUIRED_COLUMNS:
+        valid_required_mask &= aligned_df[required_col].astype(str).str.strip() != ''
+    aligned_df = aligned_df[valid_required_mask].copy()
+    blank_rows_removed = before_blank_filter - len(aligned_df)
+
+    if aligned_df.empty:
+        return False, "No valid rows found. Cross-Reference No. and Item No. must both have values.", None
+
+    uploaded_keys = _normalize_item_cross_ref_key(aligned_df[ITEM_CROSS_REF_KEY_COLUMN])
+    duplicate_upload_rows = int(uploaded_keys.duplicated(keep='last').sum())
+    if duplicate_upload_rows:
+        aligned_df = aligned_df.loc[~uploaded_keys.duplicated(keep='last')].copy()
+        uploaded_keys = _normalize_item_cross_ref_key(aligned_df[ITEM_CROSS_REF_KEY_COLUMN])
+
+    cross_ref_path = get_item_cross_ref_path()
+    if os.path.exists(cross_ref_path):
+        if is_file_in_use(cross_ref_path):
+            return False, "rx_item_cross_ref.csv is currently in use. Please close it and try again.", None
+        existing_df = pd.read_csv(cross_ref_path, dtype=str).fillna('')
+    else:
+        existing_df = pd.DataFrame(columns=expected_columns)
+
+    for col in expected_columns:
+        if col not in existing_df.columns:
+            existing_df[col] = ''
+    existing_df = existing_df[expected_columns].fillna('')
+
+    existing_keys = _normalize_item_cross_ref_key(existing_df[ITEM_CROSS_REF_KEY_COLUMN])
+    upload_key_set = set(uploaded_keys)
+    existing_key_set = set(existing_keys[existing_keys != ''])
+
+    replaced_count = len(upload_key_set & existing_key_set)
+    added_count = len(upload_key_set - existing_key_set)
+    retained_df = existing_df.loc[~existing_keys.isin(upload_key_set)].copy()
+    updated_df = pd.concat([retained_df, aligned_df], ignore_index=True)
+    updated_df.to_csv(cross_ref_path, index=False, encoding='utf-8-sig')
+
+    load_cross_reference_csv.clear()
+
+    details = {
+        'total_records': len(updated_df),
+        'uploaded_rows': len(aligned_df),
+        'replaced_count': replaced_count,
+        'added_count': added_count,
+        'blank_rows_removed': blank_rows_removed,
+        'duplicate_upload_rows': duplicate_upload_rows,
+        'missing_optional': missing_optional,
+        'extra_columns': extra_columns,
+        'preview_df': updated_df.tail(min(len(aligned_df), 100)),
+    }
+    message = (
+        f"Successfully updated {ITEM_CROSS_REF_FILENAME}. "
+        f"Replaced {replaced_count:,} existing row(s), added {added_count:,} new row(s). "
+        f"Total records: {len(updated_df):,}."
+    )
+    return True, message, details
 
 # --------------------------------------------------------------
 # Database Credentials Helper
@@ -1001,9 +1201,8 @@ def merge_standard_cost_to_cross_ref():
         (success: bool, message: str, updated_count: int)
     """
     try:
-        csv_dir = get_csv_dir()
-        table_item_path = os.path.join(csv_dir, 'table_item.csv')
-        cross_ref_path = os.path.join(csv_dir, 'rx_item_cross_ref.csv')
+        table_item_path = os.path.join(get_csv_dir(), 'table_item.csv')
+        cross_ref_path = get_item_cross_ref_path()
         
         # Check if table_item.csv exists
         if not os.path.exists(table_item_path):
@@ -1070,8 +1269,8 @@ def load_cross_reference_csv():
     """Load cross-reference CSV file (rx_item_cross_ref.csv) for Item Code cross-referencing.
     This file is separate from rx_md_masterlist.csv which has a different purpose."""
     try:
-        # Get the CSV directory (temp directory to avoid file locking issues)
-        csv_dir = get_csv_dir()
+        # Cross-reference data is a persistent reference file, not a temp export.
+        csv_dir = get_reference_csv_dir()
         # Use rx_item_cross_ref.csv for cross-referencing (separate from masterlist)
         csv_path = os.path.join(csv_dir, 'rx_item_cross_ref.csv')
         
@@ -1204,8 +1403,9 @@ def format_time_hhmmss(elapsed_seconds):
     seconds = int(elapsed_seconds % 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-def generate_filename_from_trans_date(df, prefix='Summary_RXTracking_Report'):
+def generate_filename_from_trans_date(df, prefix='Summary_RXTracking_Report', extension='csv'):
     """Generate filename with month and year from Trans Date column."""
+    extension = extension.lstrip('.')
     try:
         if 'Trans Date' in df.columns and not df.empty:
             # Get the first non-null trans_date value
@@ -1230,12 +1430,114 @@ def generate_filename_from_trans_date(df, prefix='Summary_RXTracking_Report'):
                 if pd.notna(date_obj):
                     month_name = date_obj.strftime('%B')  # Full month name (e.g., "July")
                     year = date_obj.strftime('%Y')  # Year (e.g., "2025")
-                    return f"{prefix}_{month_name}_{year}.csv"
+                    return f"{prefix}_{month_name}_{year}.{extension}"
     except Exception:
         pass
     
     # Fallback to default filename
-    return f"{prefix}.csv"
+    return f"{prefix}.{extension}"
+
+
+def prepare_matched_report_export_df(matched_df):
+    """
+    Prepare matched data for final CSV/Excel report export only.
+    Upload PTR (PTR No) -> mdc_ptr_no in the first column slot.
+    Masterlist/reference PTR (md_ptrs) -> master_ptr_no in the last column slot.
+    """
+    download_df = matched_df.copy()
+
+    if 'Trans Date' in download_df.columns:
+        def split_trans_date(date_value):
+            if pd.isna(date_value) or date_value == '':
+                return pd.Series({'YEAR': '', 'MONTH': '', 'DAYS': ''})
+            try:
+                date_obj = pd.to_datetime(date_value, errors='coerce')
+                if pd.isna(date_obj):
+                    return pd.Series({'YEAR': '', 'MONTH': '', 'DAYS': ''})
+                return pd.Series({
+                    'YEAR': str(date_obj.year),
+                    'MONTH': str(date_obj.month).zfill(2),
+                    'DAYS': str(date_obj.day).zfill(2),
+                })
+            except Exception:
+                return pd.Series({'YEAR': '', 'MONTH': '', 'DAYS': ''})
+
+        date_split = download_df['Trans Date'].apply(split_trans_date)
+        download_df['YEAR'] = date_split['YEAR']
+        download_df['MONTH'] = date_split['MONTH']
+        download_df['DAYS'] = date_split['DAYS']
+
+    rename_dict = {
+        'PTR No': 'mdc_ptr_no',
+        'md_ptrs': 'master_ptr_no',
+        'suggested_md': 'suggest_dn',
+        'md_official_name': 'MD NAME FINAL',
+    }
+    download_df = download_df.rename(columns={k: v for k, v in rename_dict.items() if k in download_df.columns})
+
+    export_column_order = [
+        'mdc_ptr_no', 'suggest_dn', 'CUSTOMER_CODE', 'MD NAME FINAL', 'suggested_name', 'quick_suggest_name',
+        'Doctor Name', 'Branch Code', 'Branch Name', 'YEAR', 'MONTH', 'DAYS', 'Address1', 'Address2',
+        'Supplier Code', 'Supplier Name', "Vendor's Name",
+        'Item Code', 'InnoGen Item Code', 'Item Name', 'InnoGen Item Name', 'Standard Cost', 'Qty', 'Amount',
+        'OSCA DISC', 'DIVISION', 'VAT Product Posting Group', 'PERIOD',
+        'DOCTOR_CODE', 'file_loc',
+        'master_ptr_no',
+    ]
+    export_reserved_names = {'PTR No', 'md_ptrs', 'PTR FINAL', 'mdc_ptr_no', 'master_ptr_no'}
+
+    download_columns = [col for col in export_column_order if col in download_df.columns]
+    remaining_cols = [
+        col for col in download_df.columns
+        if col not in download_columns and col not in export_reserved_names
+    ]
+    if 'master_ptr_no' in download_columns:
+        master_ptr_idx = download_columns.index('master_ptr_no')
+        download_columns = download_columns[:master_ptr_idx] + remaining_cols + download_columns[master_ptr_idx:]
+    else:
+        download_columns.extend(remaining_cols)
+        if 'master_ptr_no' in download_df.columns:
+            download_columns.append('master_ptr_no')
+
+    download_df = download_df[download_columns]
+
+    sort_columns = []
+    sort_ascending = []
+    if 'suggest_dn' in download_df.columns:
+        sort_columns.append('suggest_dn')
+        sort_ascending.append(False)
+    elif 'suggested_md' in download_df.columns:
+        sort_columns.append('suggested_md')
+        sort_ascending.append(False)
+
+    if all(col in download_df.columns for col in ['YEAR', 'MONTH', 'DAYS']):
+        sort_columns.extend(['YEAR', 'MONTH', 'DAYS'])
+        sort_ascending.extend([True, True, True])
+    elif 'Trans Date' in download_df.columns:
+        try:
+            download_df['_temp_sort_date'] = pd.to_datetime(download_df['Trans Date'], errors='coerce')
+            sort_columns.append('_temp_sort_date')
+            sort_ascending.append(True)
+        except Exception:
+            sort_columns.append('Trans Date')
+            sort_ascending.append(True)
+
+    if sort_columns:
+        try:
+            download_df = download_df.sort_values(sort_columns, ascending=sort_ascending, na_position='last')
+            if '_temp_sort_date' in download_df.columns:
+                download_df = download_df.drop(columns=['_temp_sort_date'])
+        except Exception:
+            pass
+
+    return download_df
+
+
+def sanitize_matched_report_export_columns(df):
+    """Normalize column headers for CSV/Excel export compatibility."""
+    df_out = df.copy()
+    df_out.columns = [col.replace(' ', '_').replace("'", '') for col in df_out.columns]
+    return df_out
 
 def calculate_similarity(str1, str2):
     """Calculate similarity ratio between two strings using SequenceMatcher or rapidfuzz if available."""
@@ -4819,6 +5121,280 @@ def split_matching_for_unmatched(df, masterlist_df, progress_bar=None, status_te
     
     return df_work, updated_count, completion_info
 
+def _parse_claimed_total_amount(total_amount_value):
+    """Convert header Total Amount string to float."""
+    if total_amount_value is None:
+        return None
+    try:
+        return float(str(total_amount_value).replace(',', '').replace('P', '').replace(' ', '').strip())
+    except (ValueError, TypeError):
+        return None
+
+def validate_txt_file_header_claims(content, file_location='Unknown'):
+    """Validate header Number of Records and Total Amount against parsed data."""
+    df, summary = load_data_from_content(content, file_location)
+
+    claimed_records = summary.get('num_records')
+    claimed_amount = _parse_claimed_total_amount(summary.get('total_amount'))
+
+    result = {
+        'file_location': file_location,
+        'claimed_records': claimed_records,
+        'claimed_amount': claimed_amount,
+        'actual_records': None,
+        'actual_amount': None,
+        'records_match': None,
+        'amount_match': None,
+        'records_diff': None,
+        'amount_diff': None,
+        'parse_error': summary.get('error'),
+    }
+
+    if df is None or df.empty:
+        return result
+
+    result['actual_records'] = len(df)
+
+    if 'Amount' in df.columns:
+        amounts = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+        result['actual_amount'] = float(amounts.sum())
+    else:
+        result['actual_amount'] = 0.0
+
+    if claimed_records is not None and result['actual_records'] is not None:
+        result['records_diff'] = result['actual_records'] - claimed_records
+        result['records_match'] = result['records_diff'] == 0
+
+    if claimed_amount is not None and result['actual_amount'] is not None:
+        result['amount_diff'] = result['actual_amount'] - claimed_amount
+        result['amount_match'] = abs(result['amount_diff']) <= 0.01
+
+    return result
+
+def collect_txt_header_validations(uploaded_files, zip_files_cache):
+    """Run header validation for every TXT file in uploads (including inside ZIPs)."""
+    validations = []
+
+    for zip_file_obj in [f for f in uploaded_files if f.name.lower().endswith('.zip')]:
+        try:
+            zip_content = zip_files_cache.get(zip_file_obj.name)
+            if zip_content is None:
+                zip_content = zip_file_obj.read()
+                zip_files_cache[zip_file_obj.name] = zip_content
+
+            with zipfile.ZipFile(BytesIO(zip_content)) as zip_file:
+                for file_path_in_zip in [f for f in zip_file.namelist() if f.lower().endswith('.txt')]:
+                    content = zip_file.read(file_path_in_zip)
+                    file_location = f"{zip_file_obj.name}/{file_path_in_zip}".replace('\\', '/')
+                    validations.append(validate_txt_file_header_claims(content, file_location))
+        except Exception as e:
+            validations.append({
+                'file_location': zip_file_obj.name,
+                'claimed_records': None,
+                'claimed_amount': None,
+                'actual_records': None,
+                'actual_amount': None,
+                'records_match': None,
+                'amount_match': None,
+                'records_diff': None,
+                'amount_diff': None,
+                'parse_error': f'Error reading ZIP: {e}',
+            })
+
+    for txt_file_obj in [f for f in uploaded_files if f.name.lower().endswith('.txt')]:
+        try:
+            content = txt_file_obj.read()
+            file_location = txt_file_obj.name.replace('\\', '/')
+            validations.append(validate_txt_file_header_claims(content, file_location))
+        except Exception as e:
+            validations.append({
+                'file_location': txt_file_obj.name.replace('\\', '/'),
+                'claimed_records': None,
+                'claimed_amount': None,
+                'actual_records': None,
+                'actual_amount': None,
+                'records_match': None,
+                'amount_match': None,
+                'records_diff': None,
+                'amount_diff': None,
+                'parse_error': f'Error reading file: {e}',
+            })
+
+    return validations
+
+def _upload_files_fingerprint(uploaded_files):
+    return tuple(sorted((f.name, f.size) for f in uploaded_files))
+
+def _format_records_validation_cell(validation):
+    if validation.get('parse_error'):
+        return f"❌ Parse error: {validation['parse_error']}"
+    if validation.get('records_match') is True:
+        return f"✅ Match ({validation['claimed_records']:,})"
+    if validation.get('records_match') is False:
+        claimed = validation.get('claimed_records')
+        actual = validation.get('actual_records')
+        diff = validation.get('records_diff')
+        return (
+            f"❌ Header: {claimed:,} | Actual: {actual:,} | Diff: {diff:+,}"
+        )
+    return 'N/A'
+
+def _format_amount_validation_cell(validation):
+    if validation.get('parse_error'):
+        return 'N/A'
+    if validation.get('amount_match') is True:
+        return f"✅ Match (P {validation['claimed_amount']:,.2f})"
+    if validation.get('amount_match') is False:
+        claimed = validation.get('claimed_amount')
+        actual = validation.get('actual_amount')
+        diff = validation.get('amount_diff')
+        return (
+            f"❌ Header: P {claimed:,.2f} | Actual: P {actual:,.2f} | Diff: P {diff:+,.2f}"
+        )
+    return 'N/A'
+
+def _validation_has_mismatch(validation):
+    if validation.get('parse_error'):
+        return True
+    if validation.get('records_match') is False:
+        return True
+    if validation.get('amount_match') is False:
+        return True
+    return False
+
+def summarize_amounts_by_zip(header_validations):
+    """Sum validated TXT amounts grouped by parent ZIP file name."""
+    zip_totals = {}
+    for validation in header_validations or []:
+        file_location = validation.get('file_location', '')
+        if '/' not in file_location:
+            continue
+        zip_name, _, _ = file_location.partition('/')
+        amount = validation.get('actual_amount')
+        if amount is None:
+            amount = validation.get('claimed_amount')
+        if amount is None:
+            continue
+        zip_totals[zip_name] = zip_totals.get(zip_name, 0.0) + float(amount)
+    return zip_totals
+
+def get_validation_amount_for_file(header_validations, file_location):
+    """Get validated amount for a single TXT file path."""
+    normalized = file_location.replace('\\', '/')
+    for validation in header_validations or []:
+        if validation.get('file_location', '').replace('\\', '/') == normalized:
+            amount = validation.get('actual_amount')
+            if amount is None:
+                amount = validation.get('claimed_amount')
+            return amount
+    return None
+
+def format_total_amount_display(amount):
+    """Format amount for display in file summary tables."""
+    if amount is None:
+        return 'N/A'
+    return f"P {float(amount):,.2f}"
+
+def validate_combined_summary_totals(combined_summary, combined_df):
+    """Compare summary header totals against combined transaction data."""
+    result = {
+        'records_match': None,
+        'amount_match': None,
+        'actual_records': None,
+        'actual_amount': None,
+    }
+
+    if combined_df is None or combined_df.empty:
+        return result
+
+    result['actual_records'] = len(combined_df)
+
+    claimed_records = combined_summary.get('num_records', 0)
+    if claimed_records > 0:
+        result['records_match'] = claimed_records == result['actual_records']
+
+    if 'Amount' in combined_df.columns:
+        result['actual_amount'] = float(
+            pd.to_numeric(combined_df['Amount'], errors='coerce').fillna(0).sum()
+        )
+        claimed_amount = combined_summary.get('total_amount', 0.0)
+        if claimed_amount > 0:
+            result['amount_match'] = abs(claimed_amount - result['actual_amount']) <= 0.01
+
+    return result
+
+def validate_matched_process_totals(combined_df, matched_df, combined_summary=None):
+    """Validate matched results preserve row count and total amount from combined data."""
+    result = {
+        'records_match': None,
+        'amount_match': None,
+        'combined_records': None,
+        'matched_records': None,
+        'combined_amount': None,
+        'matched_amount': None,
+        'records_diff': None,
+        'amount_diff': None,
+    }
+
+    if combined_df is None or combined_df.empty or matched_df is None or matched_df.empty:
+        return result
+
+    result['combined_records'] = len(combined_df)
+    result['matched_records'] = len(matched_df)
+    result['records_diff'] = result['matched_records'] - result['combined_records']
+    result['records_match'] = result['records_diff'] == 0
+
+    if 'Amount' in combined_df.columns and 'Amount' in matched_df.columns:
+        result['combined_amount'] = float(
+            pd.to_numeric(combined_df['Amount'], errors='coerce').fillna(0).sum()
+        )
+        result['matched_amount'] = float(
+            pd.to_numeric(matched_df['Amount'], errors='coerce').fillna(0).sum()
+        )
+        result['amount_diff'] = result['matched_amount'] - result['combined_amount']
+        result['amount_match'] = abs(result['amount_diff']) <= 0.01
+
+    if combined_summary and result['matched_records'] is not None:
+        claimed_records = combined_summary.get('num_records', 0)
+        if claimed_records > 0 and result['records_match']:
+            result['records_match'] = claimed_records == result['matched_records']
+
+    if combined_summary and result['matched_amount'] is not None:
+        claimed_amount = combined_summary.get('total_amount', 0.0)
+        if claimed_amount > 0 and result['amount_match']:
+            result['amount_match'] = abs(claimed_amount - result['matched_amount']) <= 0.01
+
+    return result
+
+def build_header_validation_display_df(validations):
+    rows = []
+    for idx, validation in enumerate(validations, start=1):
+        file_location = validation.get('file_location', 'Unknown')
+        rows.append({
+            'File #': idx,
+            'File Location': file_location,
+            'File Name': file_location.split('/')[-1],
+            'Records Validation': _format_records_validation_cell(validation),
+            'Amount Validation': _format_amount_validation_cell(validation),
+        })
+    return pd.DataFrame(rows)
+
+def style_header_validation_df(display_df, validations):
+    mismatch_rows = {
+        idx for idx, validation in enumerate(validations) if _validation_has_mismatch(validation)
+    }
+
+    def highlight_mismatch_rows(row):
+        styles = [''] * len(row)
+        if row.name in mismatch_rows:
+            styles = ['background-color: #ffebee'] * len(row)
+            for col_idx, col_name in enumerate(row.index):
+                if col_name in ('Records Validation', 'Amount Validation') and '❌' in str(row[col_name]):
+                    styles[col_idx] = 'background-color: #ffcdd2; color: #b71c1c; font-weight: bold'
+        return styles
+
+    return display_df.style.apply(highlight_mismatch_rows, axis=1)
+
 def load_data_from_content(content, file_location='Unknown'):
     """Load and parse the text file using pandas from file content."""
     try:
@@ -5279,6 +5855,10 @@ if 'show_reference_upload' not in st.session_state:
     st.session_state.show_reference_upload = False
 if 'reference_upload_success' not in st.session_state:
     st.session_state.reference_upload_success = None
+if 'show_item_cross_ref_upload' not in st.session_state:
+    st.session_state.show_item_cross_ref_upload = False
+if 'item_cross_ref_upload_success' not in st.session_state:
+    st.session_state.item_cross_ref_upload_success = None
 if 'combined_summary' not in st.session_state:
     st.session_state.combined_summary = {
         'num_records': 0,
@@ -5287,6 +5867,10 @@ if 'combined_summary' not in st.session_state:
     }
 if 'zip_files_cache' not in st.session_state:
     st.session_state.zip_files_cache = {}
+if 'file_header_validations' not in st.session_state:
+    st.session_state.file_header_validations = []
+if 'file_header_validation_fingerprint' not in st.session_state:
+    st.session_state.file_header_validation_fingerprint = None
 if 'matched_df' not in st.session_state:
     st.session_state.matched_df = None
 if 'md_code_list' not in st.session_state:
@@ -5495,8 +6079,8 @@ if st.session_state.md_code_list.empty:
         st.session_state.md_code_list = pd.DataFrame(columns=['DOCTOR_CODE', 'CUSTOMER_CODE', 'CUSTOMER_NAME'])
 
 # Show masterlist update option if CSV exists
-csv_dir = get_csv_dir()
-cross_ref_path = os.path.join(csv_dir, 'rx_item_cross_ref.csv')
+csv_dir = get_reference_csv_dir()
+cross_ref_path = get_item_cross_ref_path()
 cross_ref_exists = os.path.exists(cross_ref_path)
 
 if masterlist_exists:
@@ -5545,7 +6129,7 @@ if masterlist_exists:
     </script>
     """, unsafe_allow_html=True)
     
-    col_master1, col_master2, col_master3, col_master4 = st.columns([3, 1, 1, 1])
+    col_master1, col_master2, col_master3, col_master4, col_master5 = st.columns([3, 1, 1, 1.25, 1.6])
     with col_master1:
         st.info("📋 **Manual Update**: Standard Cost, Masterlist & Reference Files")
     with col_master3:
@@ -5614,7 +6198,147 @@ if masterlist_exists:
     with col_master4:
         if st.button('📤 Upload Reference Files', help='Upload CSV or Excel files with Doctor Name, Address, and PTR columns for Quick Suggest Matching', key='upload_reference_files_btn'):
             st.session_state.show_reference_upload = True
-    
+
+    with col_master5:
+        if st.button('🔗 Upload New Item Cross Reference', help='Upload an item cross-reference Excel file and refresh Standard Cost from SQL', key='upload_item_cross_ref_btn'):
+            st.session_state.show_item_cross_ref_upload = True
+            st.session_state.item_cross_ref_upload_success = None
+
+    # Item Cross-Reference Upload Modal/Dialog
+    if st.session_state.get('show_item_cross_ref_upload', False):
+        with st.expander("Upload New Item Cross Reference", expanded=True):
+            item_cross_ref_path = get_item_cross_ref_path()
+            item_cross_ref_exists = os.path.exists(item_cross_ref_path)
+
+            if item_cross_ref_exists:
+                try:
+                    current_cross_ref_df = pd.read_csv(item_cross_ref_path, dtype=str)
+                    st.info(f"Current item cross-reference table: {len(current_cross_ref_df):,} record(s)")
+                except Exception as e:
+                    st.warning(f"Could not read current item cross-reference table: {str(e)}")
+            else:
+                st.info("Current item cross-reference table: No data")
+
+            try:
+                template_data, template_file_name, template_mime = build_item_cross_ref_template()
+                st.download_button(
+                    label='Download Item Cross-Reference Template',
+                    data=template_data,
+                    file_name=template_file_name,
+                    mime=template_mime,
+                    key='download_item_cross_ref_template',
+                    help='Download a template with the current rx_item_cross_ref.csv headers and one sample row'
+                )
+            except Exception as e:
+                st.error(f"Could not build item cross-reference template: {str(e)}")
+
+            uploaded_item_cross_ref = st.file_uploader(
+                "Choose item cross-reference Excel file",
+                type=['xlsx', 'xls', 'csv'],
+                key='item_cross_ref_file_uploader',
+                help='Upload an Excel or CSV file with Cross-Reference No. and Item No. columns'
+            )
+
+            col_item_ref_upload1, col_item_ref_upload2 = st.columns(2)
+            with col_item_ref_upload1:
+                if st.button('Process and Save', key='process_item_cross_ref_upload', type='primary'):
+                    if uploaded_item_cross_ref:
+                        spinner_item_ref = st.empty()
+                        spinner_item_ref.markdown("""
+                        <div style="text-align: center; padding: 15px;">
+                            <div class="spinner-large">⏳</div>
+                            <div style="font-size: 18px; margin-top: 10px; font-weight: bold;">Saving item cross-reference...</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        try:
+                            success_upload, message_upload, upload_details = upsert_item_cross_ref_from_upload(uploaded_item_cross_ref)
+                        except Exception as e:
+                            spinner_item_ref.empty()
+                            st.error(f"Error processing item cross-reference upload: {str(e)}")
+                            logger.error(f"Item cross-reference upload error: {str(e)}\n{traceback.format_exc()}")
+                            success_upload = False
+                            message_upload = ""
+                            upload_details = None
+
+                        if success_upload:
+                            spinner_item_ref.markdown("""
+                            <div style="text-align: center; padding: 15px;">
+                                <div class="spinner-large">⏳</div>
+                                <div style="font-size: 18px; margin-top: 10px; font-weight: bold;">Updating Standard Cost from SQL...</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                            success_export, message_export, count_export = export_table_item_from_innogen()
+                            if success_export:
+                                success_merge, message_merge, updated_count = merge_standard_cost_to_cross_ref()
+                            else:
+                                success_merge = False
+                                message_merge = "Skipped because SQL export failed."
+                                updated_count = 0
+
+                            spinner_item_ref.empty()
+
+                            notes = []
+                            if upload_details:
+                                if upload_details.get('blank_rows_removed'):
+                                    notes.append(f"Removed {upload_details['blank_rows_removed']:,} row(s) with blank required fields.")
+                                if upload_details.get('duplicate_upload_rows'):
+                                    notes.append(f"Handled {upload_details['duplicate_upload_rows']:,} duplicate uploaded Cross-Reference No. row(s); kept the last one.")
+                                if upload_details.get('missing_optional'):
+                                    notes.append(f"Missing optional columns were saved blank: {', '.join(upload_details['missing_optional'])}.")
+                                if upload_details.get('extra_columns'):
+                                    notes.append(f"Ignored extra uploaded columns: {', '.join(upload_details['extra_columns'])}.")
+
+                            preview_df = upload_details['preview_df'] if upload_details else pd.DataFrame()
+                            try:
+                                refreshed_cross_ref_df = pd.read_csv(get_item_cross_ref_path(), dtype=str).fillna('')
+                                preview_df = refreshed_cross_ref_df.tail(min(len(preview_df), 100))
+                            except Exception:
+                                pass
+
+                            status_lines = [f"Upload: {message_upload}"]
+                            if notes:
+                                status_lines.append("\n".join(notes))
+                            status_lines.append(f"SQL Export: {'OK' if success_export else 'Failed'} - {message_export}")
+                            status_lines.append(f"Standard Cost Merge: {'OK' if success_merge else 'Failed'} - {message_merge}")
+
+                            st.session_state.item_cross_ref_upload_success = {
+                                'type': 'success' if success_export and success_merge else 'warning',
+                                'message': "\n\n".join(status_lines),
+                                'preview_df': preview_df,
+                                'total_records': upload_details['total_records'] if upload_details else 0,
+                            }
+                            st.session_state.show_item_cross_ref_upload = False
+                            st.rerun()
+                        else:
+                            spinner_item_ref.empty()
+                            st.error(message_upload)
+                    else:
+                        st.warning("Please upload an item cross-reference Excel or CSV file.")
+
+            with col_item_ref_upload2:
+                if st.button('Close', key='cancel_item_cross_ref_upload'):
+                    st.session_state.show_item_cross_ref_upload = False
+                    st.session_state.item_cross_ref_upload_success = None
+                    st.rerun()
+
+    # Display item cross-reference upload result outside expander
+    if st.session_state.get('item_cross_ref_upload_success') is not None:
+        item_cross_ref_success = st.session_state.item_cross_ref_upload_success
+        if item_cross_ref_success.get('type') == 'success':
+            st.success(item_cross_ref_success['message'])
+        else:
+            st.warning(item_cross_ref_success['message'])
+
+        if item_cross_ref_success.get('preview_df') is not None and not item_cross_ref_success['preview_df'].empty:
+            st.markdown("**Preview of latest item cross-reference rows:**")
+            st.dataframe(item_cross_ref_success['preview_df'], use_container_width=True, height=300)
+
+        if st.button('🏠 Return Home', key='dismiss_item_cross_ref_success'):
+            st.session_state.item_cross_ref_upload_success = None
+            st.rerun()
+
     # Reference Files Upload Modal/Dialog
     if st.session_state.get('show_reference_upload', False):
         with st.expander("📤 Upload Reference Files", expanded=True):
@@ -5931,6 +6655,29 @@ if masterlist_exists:
 
 st.divider()
 
+# Shared spinner styles for validation and processing
+st.markdown("""
+<style>
+    @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
+    .spinner {
+        display: inline-block;
+        animation: spin 1s linear infinite;
+        font-size: 40px;
+        margin-right: 10px;
+    }
+    .spinner-large {
+        display: inline-block;
+        animation: spin 1s linear infinite;
+        font-size: 60px;
+        margin: 20px;
+        text-align: center;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # File upload section
 col1, col2 = st.columns(2)
 
@@ -6008,19 +6755,48 @@ with col2:
         
         if not zip_files_list and not txt_files_list:
             st.warning('No ZIP or TXT files found in upload.')
-        
+
+        header_validations = []
+        if zip_files_list or txt_files_list:
+            upload_fingerprint = _upload_files_fingerprint(uploaded_files)
+            if st.session_state.file_header_validation_fingerprint != upload_fingerprint:
+                with st.spinner("Validating Data"):
+                    st.session_state.file_header_validations = collect_txt_header_validations(
+                        uploaded_files,
+                        st.session_state.zip_files_cache,
+                    )
+                    st.session_state.file_header_validation_fingerprint = upload_fingerprint
+                st.rerun()
+
+            header_validations = st.session_state.file_header_validations
+            if header_validations:
+                mismatch_count = sum(
+                    1 for validation in header_validations if _validation_has_mismatch(validation)
+                )
+                if mismatch_count:
+                    st.warning(
+                        f"⚠️ {mismatch_count} of {len(header_validations)} TXT file(s) "
+                        f"have header claims that do not match parsed data."
+                    )
+                else:
+                    st.success(
+                        f"✅ All {len(header_validations)} TXT file(s) match their header claims."
+                    )
+
         # File details expander
         if zip_files_list or txt_files_list:
             with st.expander("📋 View File Details", expanded=False):
                 file_info_data = []
+                zip_amount_totals = summarize_amounts_by_zip(header_validations)
                 
                 # Add ZIP files
                 for idx, zip_info in enumerate(zip_info_list):
+                    zip_total_amount = zip_amount_totals.get(zip_info['name'])
                     file_info_data.append({
                         'File #': idx + 1,
-                        'File Location': zip_info['name'],
                         'File Name': zip_info['name'],
                         'Size (MB)': f"{zip_info['size'] / (1024*1024):.2f}",
+                        'Total Amount': format_total_amount_display(zip_total_amount),
                         'Type': 'application/zip',
                         'Note': f"Contains {zip_info['txt_count']} .txt files" if zip_info['txt_count'] > 0 else f"Error: {zip_info.get('error', 'Unknown')}"
                     })
@@ -6030,6 +6806,7 @@ with col2:
                     file_path = file.name
                     file_path = file_path.replace('\\', '/')
                     file_name_only = file_path.split('/')[-1]
+                    txt_total_amount = get_validation_amount_for_file(header_validations, file_path)
                     
                     # Check if this file failed to process
                     failed_note = 'Direct TXT file'
@@ -6040,9 +6817,9 @@ with col2:
                     
                     file_info_data.append({
                         'File #': len(zip_files_list) + idx + 1,
-                        'File Location': file_path,
                         'File Name': file_name_only,
                         'Size (MB)': f"{file.size / (1024*1024):.2f}",
+                        'Total Amount': format_total_amount_display(txt_total_amount),
                         'Type': file.type if hasattr(file, 'type') else 'text/plain',
                         'Note': failed_note
                     })
@@ -6060,15 +6837,24 @@ with col2:
                             
                             file_info_data.append({
                                 'File #': len(zip_files_list) + len(txt_files_list) + failed_count,
-                                'File Location': file_name,
                                 'File Name': file_name_only,
                                 'Size (MB)': 'N/A',
+                                'Total Amount': 'N/A',
                                 'Type': 'text/plain',
                                 'Note': f"❌ Failed: {failed_file.get('error_reason', 'Unknown error')} (from {zip_name})"
                             })
                 
                 file_info_df = pd.DataFrame(file_info_data)
                 st.dataframe(file_info_df, use_container_width=True, hide_index=True)
+
+                if header_validations:
+                    st.markdown("**Header Validation (Number of Records / Total Amount)**")
+                    validation_display_df = build_header_validation_display_df(header_validations)
+                    styled_validation_df = style_header_validation_df(
+                        validation_display_df,
+                        header_validations,
+                    )
+                    st.dataframe(styled_validation_df, use_container_width=True, hide_index=True)
                 
                 # Show summary of failed files if any
                 if st.session_state.failed_files:
@@ -6093,6 +6879,8 @@ if st.button('🗑️ Clear All', type='secondary'):
     # Clear ZIP file cache
     if 'zip_files_cache' in st.session_state:
         st.session_state.zip_files_cache = {}
+    st.session_state.file_header_validations = []
+    st.session_state.file_header_validation_fingerprint = None
     st.rerun()
 
 # Process files
@@ -6615,6 +7403,14 @@ if uploaded_files:
     st.divider()
     st.subheader('📈 Summary')
     
+    combined_df_for_validation = st.session_state.combined_df
+    summary_validation = validate_combined_summary_totals(
+        combined_summary,
+        combined_df_for_validation,
+    )
+    records_validated = summary_validation.get('records_match') is True
+    amount_validated = summary_validation.get('amount_match') is True
+
     if combined_summary['file_count'] > 0:
         col_sum1, col_sum2, col_sum3 = st.columns(3)
     
@@ -6623,15 +7419,28 @@ if uploaded_files:
     
     with col_sum2:
         if combined_summary['num_records'] > 0:
-            st.metric('Total Records', f"{combined_summary['num_records']:,}")
+            records_label = '✅ Total Records' if records_validated else 'Total Records'
+            st.metric(records_label, f"{combined_summary['num_records']:,}")
     
     with col_sum3:
         if combined_summary['total_amount'] > 0:
             formatted_amount = f"{combined_summary['total_amount']:,.2f}"
-            st.metric('Total Amount', f"P {formatted_amount}")
-        
-        if st.session_state.combined_df is not None and not st.session_state.combined_df.empty:
-            st.caption(f"Combined Records in Table: {len(st.session_state.combined_df):,}")
+            amount_label = '✅ Total Amount' if amount_validated else 'Total Amount'
+            st.metric(amount_label, f"P {formatted_amount}")
+
+    if records_validated and amount_validated:
+        st.success('✅ Summary totals match combined transaction data.')
+    elif combined_df_for_validation is not None and not combined_df_for_validation.empty:
+        if summary_validation.get('records_match') is False:
+            st.warning(
+                f"⚠️ Total Records mismatch: header sum {combined_summary['num_records']:,} "
+                f"vs combined data {summary_validation['actual_records']:,}."
+            )
+        if summary_validation.get('amount_match') is False:
+            st.warning(
+                f"⚠️ Total Amount mismatch: header sum P {combined_summary['total_amount']:,.2f} "
+                f"vs combined data P {summary_validation['actual_amount']:,.2f}."
+            )
     
     # Display failed files
     if st.session_state.failed_files:
@@ -7012,6 +7821,10 @@ if uploaded_files:
                         del st.session_state.matched_csv_cache
                     if 'matched_csv_filename' in st.session_state:
                         del st.session_state.matched_csv_filename
+                    if 'matched_xlsx_cache' in st.session_state:
+                        del st.session_state.matched_xlsx_cache
+                    if 'matched_xlsx_filename' in st.session_state:
+                        del st.session_state.matched_xlsx_filename
                     
                     # Start timing the process
                     start_time = time.time()
@@ -8006,6 +8819,16 @@ if uploaded_files:
                         amount_series_numeric = amount_series.apply(ensure_numeric_for_sum)
                         # Sum the numeric values
                         total_amount = pd.to_numeric(amount_series_numeric, errors='coerce').fillna(0.0).sum()
+
+                    process_validation = validate_matched_process_totals(
+                        st.session_state.combined_df,
+                        st.session_state.matched_df,
+                        st.session_state.get('combined_summary'),
+                    )
+                    records_validated = process_validation.get('records_match') is True
+                    amount_validated = process_validation.get('amount_match') is True
+                    total_records_title = '✅ Total Records' if records_validated else 'Total Records'
+                    total_amount_title = '✅ Total Amount' if amount_validated else 'Total Amount'
                     
                     # Display metrics in two rows with colored dashboard-style cards
                     # Define metric card style function (compact version)
@@ -8036,7 +8859,7 @@ if uploaded_files:
                     col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
                     with col_stat1:
                         st.markdown(create_metric_card(
-                            'Total Records', 
+                            total_records_title,
                             f"{total_records:,}", 
                             "#1e3c72", 
                             "#2a5298",
@@ -8094,12 +8917,32 @@ if uploaded_files:
                         ), unsafe_allow_html=True)
                     with col_stat8:
                         st.markdown(create_metric_card(
-                            'Total Amount', 
+                            total_amount_title,
                             f"P {total_amount:,.2f}", 
                             "#f59e0b", 
                             "#fbbf24",
                             "💰"
                         ), unsafe_allow_html=True)
+
+                    if records_validated and amount_validated:
+                        st.success(
+                            '✅ Process validation: Total Records and Total Amount match combined transaction data.'
+                        )
+                    else:
+                        if process_validation.get('records_match') is False:
+                            st.warning(
+                                f"⚠️ Total Records mismatch after processing: "
+                                f"combined {process_validation['combined_records']:,} "
+                                f"vs matched {process_validation['matched_records']:,} "
+                                f"(diff {process_validation['records_diff']:+,})."
+                            )
+                        if process_validation.get('amount_match') is False:
+                            st.warning(
+                                f"⚠️ Total Amount mismatch after processing: "
+                                f"combined P {process_validation['combined_amount']:,.2f} "
+                                f"vs matched P {process_validation['matched_amount']:,.2f} "
+                                f"(diff P {process_validation['amount_diff']:+,.2f})."
+                            )
                 
                 # Format OSCA DISC to show 2 decimal places for display
                 if 'OSCA DISC' in matched_display_df.columns:
@@ -8151,141 +8994,81 @@ if uploaded_files:
                     height=600
                 )
                 
-                # Download button for matched data
-                # Check if CSV is already cached to avoid regenerating
+                # Download buttons for matched data (final report export only)
                 csv_ready = 'matched_csv_cache' in st.session_state and 'matched_csv_filename' in st.session_state
+                xlsx_ready = 'matched_xlsx_cache' in st.session_state and 'matched_xlsx_filename' in st.session_state
                 
-                # Create placeholder outside the conditional to ensure it can be cleared
-                csv_placeholder = st.empty()
+                export_placeholder = st.empty()
                 
-                if csv_ready:
-                    # CSV is already ready, ensure placeholder is empty
-                    csv_placeholder.empty()
+                if csv_ready and xlsx_ready:
+                    export_placeholder.empty()
                 else:
-                    # Show loading indicator while CSV is being generated
-                    with csv_placeholder.container():
-                        st.info("⏳ Preparing CSV download (this may take 30-60 seconds for large datasets)...")
+                    with export_placeholder.container():
+                        st.info("⏳ Preparing final report download (this may take 30-60 seconds for large datasets)...")
                     
-                    # Generate CSV (this is the slow part for large datasets)
                     try:
-                        # Reorder columns for CSV download to match requested order
-                        download_df = st.session_state.matched_df.copy()
-                        
-                        # Split Trans Date into YEAR, MONTH, DAYS
-                        if 'Trans Date' in download_df.columns:
-                            def split_trans_date(date_value):
-                                """Split Trans Date into YEAR, MONTH, DAYS."""
-                                if pd.isna(date_value) or date_value == '':
-                                    return pd.Series({'YEAR': '', 'MONTH': '', 'DAYS': ''})
-                                try:
-                                    # Try to parse as datetime
-                                    if isinstance(date_value, str):
-                                        date_obj = pd.to_datetime(date_value, errors='coerce')
-                                    else:
-                                        date_obj = pd.to_datetime(date_value, errors='coerce')
-                                    
-                                    if pd.isna(date_obj):
-                                        return pd.Series({'YEAR': '', 'MONTH': '', 'DAYS': ''})
-                                    
-                                    return pd.Series({
-                                        'YEAR': str(date_obj.year),
-                                        'MONTH': str(date_obj.month).zfill(2),
-                                        'DAYS': str(date_obj.day).zfill(2)
-                                    })
-                                except Exception:
-                                    return pd.Series({'YEAR': '', 'MONTH': '', 'DAYS': ''})
-                            
-                            # Apply splitting to create YEAR, MONTH, DAYS columns
-                            date_split = download_df['Trans Date'].apply(split_trans_date)
-                            download_df['YEAR'] = date_split['YEAR']
-                            download_df['MONTH'] = date_split['MONTH']
-                            download_df['DAYS'] = date_split['DAYS']
-                        
-                        # Rename columns for download
-                        rename_dict = {
-                            'md_ptrs': 'PTR FINAL',
-                            'suggested_md': 'suggest_dn',
-                            'md_official_name': 'MD NAME FINAL'
-                        }
-                        download_df = download_df.rename(columns=rename_dict)
-                        
-                        matched_column_order = [
-                            'PTR FINAL', 'suggest_dn', 'CUSTOMER_CODE', 'MD NAME FINAL', 'suggested_name', 'quick_suggest_name', 
-                            'Doctor Name', 'Branch Code', 'Branch Name', 'YEAR', 'MONTH', 'DAYS', 'Address1', 'Address2',
-                            'Supplier Code', 'Supplier Name', "Vendor's Name",
-                            'Item Code', 'InnoGen Item Code', 'Item Name', 'InnoGen Item Name', 'Standard Cost', 'Qty', 'Amount',
-                            'OSCA DISC', 'DIVISION', 'VAT Product Posting Group', 'PERIOD', 'PTR No',
-                            'DOCTOR_CODE', 'file_loc'
-                        ]
-                        
-                        # Only include columns that exist
-                        download_columns = [col for col in matched_column_order if col in download_df.columns]
-                        # Add any remaining columns that weren't in the order list
-                        remaining_cols = [col for col in download_df.columns if col not in download_columns]
-                        download_columns.extend(remaining_cols)
-                        download_df = download_df[download_columns]
-                        
-                        # Sort by suggest_dn (True first) and YEAR, MONTH, DAYS
-                        sort_columns = []
-                        sort_ascending = []
-                        
-                        if 'suggest_dn' in download_df.columns:
-                            sort_columns.append('suggest_dn')
-                            sort_ascending.append(False)  # True values first (matched records)
-                        elif 'suggested_md' in download_df.columns:
-                            sort_columns.append('suggested_md')
-                            sort_ascending.append(False)
-                        
-                        # Sort by YEAR, MONTH, DAYS if available, otherwise by Trans Date
-                        if all(col in download_df.columns for col in ['YEAR', 'MONTH', 'DAYS']):
-                            sort_columns.extend(['YEAR', 'MONTH', 'DAYS'])
-                            sort_ascending.extend([True, True, True])  # Ascending order
-                        elif 'Trans Date' in download_df.columns:
-                            try:
-                                # Create a temporary datetime column for sorting
-                                download_df['_temp_sort_date'] = pd.to_datetime(download_df['Trans Date'], errors='coerce')
-                                sort_columns.append('_temp_sort_date')
-                                sort_ascending.append(True)  # Ascending date order (oldest first)
-                            except Exception:
-                                sort_columns.append('Trans Date')
-                                sort_ascending.append(True)
-                        
-                        if sort_columns:
-                            try:
-                                download_df = download_df.sort_values(sort_columns, ascending=sort_ascending, na_position='last')
-                                # Remove temporary column if it exists
-                                if '_temp_sort_date' in download_df.columns:
-                                    download_df = download_df.drop(columns=['_temp_sort_date'])
-                            except Exception:
-                                pass
-                        
-                        # Rename columns: replace spaces with underscores and remove apostrophes for CSV compatibility
-                        # Create a copy to avoid modifying the original dataframe
-                        download_df_for_csv = download_df.copy()
-                        # Rename all columns: replace spaces with underscores and remove apostrophes (single quotes)
-                        download_df_for_csv.columns = [col.replace(' ', '_').replace("'", '') for col in download_df_for_csv.columns]
-                        
-                        # Generate CSV and cache it (this is the slow operation for large datasets)
-                        csv = download_df_for_csv.to_csv(index=False)
-                        filename = generate_filename_from_trans_date(download_df, 'Summary_RXTracking_Report')
+                        download_df = prepare_matched_report_export_df(st.session_state.matched_df)
+                        download_df_for_export = sanitize_matched_report_export_columns(download_df)
+
+                        csv = download_df_for_export.to_csv(index=False)
                         st.session_state.matched_csv_cache = csv
-                        st.session_state.matched_csv_filename = filename
+                        st.session_state.matched_csv_filename = generate_filename_from_trans_date(
+                            download_df, 'Summary_RXTracking_Report', extension='csv'
+                        )
+
+                        xlsx_output = BytesIO()
+                        with pd.ExcelWriter(xlsx_output, engine='openpyxl') as writer:
+                            download_df_for_export.to_excel(writer, index=False, sheet_name='RX Tracking Report')
+                        st.session_state.matched_xlsx_cache = xlsx_output.getvalue()
+                        st.session_state.matched_xlsx_filename = generate_filename_from_trans_date(
+                            download_df, 'Summary_RXTracking_Report', extension='xlsx'
+                        )
+
                         csv_ready = True
-                        
-                        # Clear the status message placeholder once CSV is ready
-                        csv_placeholder.empty()
+                        xlsx_ready = True
+                        export_placeholder.empty()
+                    except ImportError:
+                        export_placeholder.warning("⚠️ openpyxl is required for Excel export. CSV download is still available.")
+                        try:
+                            if 'matched_csv_cache' not in st.session_state:
+                                download_df = prepare_matched_report_export_df(st.session_state.matched_df)
+                                download_df_for_export = sanitize_matched_report_export_columns(download_df)
+                                st.session_state.matched_csv_cache = download_df_for_export.to_csv(index=False)
+                                st.session_state.matched_csv_filename = generate_filename_from_trans_date(
+                                    download_df, 'Summary_RXTracking_Report', extension='csv'
+                                )
+                            csv_ready = True
+                            xlsx_ready = False
+                            export_placeholder.empty()
+                        except Exception as e:
+                            export_placeholder.error(f"❌ Error preparing CSV: {str(e)}")
+                            csv_ready = False
+                            xlsx_ready = False
                     except Exception as e:
-                        csv_placeholder.error(f"❌ Error preparing CSV: {str(e)}")
+                        export_placeholder.error(f"❌ Error preparing final report: {str(e)}")
                         csv_ready = False
+                        xlsx_ready = False
                 
-                # Display download button (use cached CSV if available)
-                if csv_ready:
-                    st.download_button(
-                        label='📥 Download Matched Data as CSV',
-                        data=st.session_state.matched_csv_cache,
-                        file_name=st.session_state.matched_csv_filename,
-                        mime='text/csv'
-                    )
+                if csv_ready or xlsx_ready:
+                    col_csv_dl, col_xlsx_dl = st.columns(2)
+                    if csv_ready:
+                        with col_csv_dl:
+                            st.download_button(
+                                label='📥 Download Final Report (CSV)',
+                                data=st.session_state.matched_csv_cache,
+                                file_name=st.session_state.matched_csv_filename,
+                                mime='text/csv',
+                                key='download_matched_csv_btn',
+                            )
+                    if xlsx_ready:
+                        with col_xlsx_dl:
+                            st.download_button(
+                                label='📥 Download Final Report (Excel)',
+                                data=st.session_state.matched_xlsx_cache,
+                                file_name=st.session_state.matched_xlsx_filename,
+                                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                                key='download_matched_xlsx_btn',
+                            )
                 
                 # Download buttons for reference files
                 st.divider()
@@ -8314,8 +9097,7 @@ if uploaded_files:
                     
                     with col_ref2:
                         # Download button for cross-reference
-                        csv_dir = get_csv_dir()
-                        crossref_path = os.path.join(csv_dir, 'rx_item_cross_ref.csv')
+                        crossref_path = get_item_cross_ref_path()
                         if os.path.exists(crossref_path):
                             try:
                                 with open(crossref_path, 'rb') as f:
